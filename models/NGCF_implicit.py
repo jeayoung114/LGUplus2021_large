@@ -9,15 +9,15 @@ import scipy.sparse as sp
 
 
 class NGCF_implicit(nn.Module):
-    def __init__(self, train, valid, learning_rate, regs, batch_size, num_epochs, emb_size, layers_size, node_dropout, mess_dropout, device):
+    def __init__(self, train, valid, learning_rate, regs, batch_size, num_epochs, emb_size, layers_size, node_dropout, mess_dropout, use_bpr, device):
         super(NGCF_implicit, self).__init__()
 
-        self.train = train
-        self.valid = valid
+        self.train_mat = sp.csr_matrix(train) #train
+        self.valid_mat = sp.csr_matrix(valid)  #valid
 
-        self.num_users, self.num_items = self.train.shape
+        self.num_users, self.num_items = self.train_mat.shape
 
-        self.R = train
+        self.R = sp.csr_matrix(train) #train
 
         self.norm_adj = self.create_adj_mat()
 
@@ -28,8 +28,9 @@ class NGCF_implicit(nn.Module):
         self.num_epochs = num_epochs
         self.node_dropout = node_dropout
         self.mess_dropout = mess_dropout
+        self.use_bpr = use_bpr
 
-        self.layers = eval(layers_size)
+        self.layers = layers_size #eval(layers_size)
         self.decay = regs
 
         """
@@ -42,13 +43,14 @@ class NGCF_implicit(nn.Module):
         *********************************************************
         Get sparse adj.
         """
-        
+        self.optimizer = optim.Adam(self.parameters(), lr=self.learning_rate)
         self.sparse_norm_adj = self._convert_sp_mat_to_sp_tensor(self.norm_adj).to(self.device)
         self.to(self.device)
 
     def init_weight(self):
         # xavier init
         initializer = nn.init.xavier_uniform_
+
         embedding_dict = nn.ParameterDict({
             'user_emb': nn.Parameter(initializer(torch.empty(self.num_users,
                                                  self.emb_size))),
@@ -86,108 +88,157 @@ class NGCF_implicit(nn.Module):
         v = v[dropout_mask]
 
         out = torch.sparse.FloatTensor(i, v, x.shape).to(x.device)
+
         return out * (1. / (1 - rate))
 
     def create_bpr_loss(self, users, pos_items, neg_items):
+        # 사용자-긍정 항목, 사용자-부정 항목 점수 계산
         pos_scores = torch.sum(torch.mul(users, pos_items), axis=1)
         neg_scores = torch.sum(torch.mul(users, neg_items), axis=1)
 
-        bpr_loss = -1 * torch.mean(nn.LogSigmoid()(pos_scores - neg_scores))
+        # BPR Loss 계산
+        bpr_loss = -1 * torch.sum(nn.LogSigmoid()(pos_scores - neg_scores))
 
-        # cul regularizer
+        # Weight L2 정규화
         regularizer = (torch.norm(users) ** 2
                        + torch.norm(pos_items) ** 2
                        + torch.norm(neg_items) ** 2) / 2
-        emb_loss = self.decay * regularizer / self.batch_size
+        emb_loss = self.decay * regularizer
 
-        return bpr_loss + emb_loss, bpr_loss, emb_loss
+        return bpr_loss + emb_loss
 
     def rating(self, u_g_embeddings, pos_i_g_embeddings):
         return torch.matmul(u_g_embeddings, pos_i_g_embeddings.t())
 
-    def forward(self, users, pos_items, neg_items, drop_flag=True):
+    def forward(self, users, pos_items, neg_items, drop_flag=False):
 
+        # 사용자-항목 상호작용 그래프 정점 드롭아웃
         A_hat = self.sparse_dropout(self.sparse_norm_adj,
                                     self.node_dropout,
                                     self.sparse_norm_adj._nnz()) if drop_flag else self.sparse_norm_adj
 
+        # 초기 임베딩 불러오기
         ego_embeddings = torch.cat([self.embedding_dict['user_emb'],
                                     self.embedding_dict['item_emb']], 0)
 
+        # 각각의 레이어에서의 임베딩 결과를 저장하기 위한 공간 생성
         all_embeddings = [ego_embeddings]
 
+
+        # 레이어마다 GCN 수행
         for k in range(len(self.layers)):
-            side_embeddings = torch.sparse.mm(A_hat, ego_embeddings)
 
-            # transformed sum messages of neighbors.
-            sum_embeddings = torch.matmul(side_embeddings, self.weight_dict['W_1_%d' % k]) \
-                                             + self.weight_dict['b_1_%d' % k]
+            # 사용자 본인 메시지 생성 (Message Construction)
+            norm_embeddings = torch.sparse.mm(A_hat, ego_embeddings)
+            sum_embeddings = torch.matmul(norm_embeddings, self.weight_dict['W_1_%d' % k]) + self.weight_dict['b_1_%d' % k]
 
-            # bi messages of neighbors.
-            # element-wise product
-            bi_embeddings = torch.mul(ego_embeddings, side_embeddings)
-            # transformed bi messages of neighbors.
+            # 사용자 항목 메시지 생성 (Message Constrcution)
+            bi_embeddings = torch.mul(ego_embeddings, norm_embeddings)
             bi_embeddings = torch.matmul(bi_embeddings, self.weight_dict['W_2_%d' % k]) \
                                             + self.weight_dict['b_2_%d' % k]
 
-            # non-linear activation.
+            # 비선형 함수 적용
             ego_embeddings = nn.LeakyReLU(negative_slope=0.2)(sum_embeddings + bi_embeddings)
 
-            # message dropout. #################################
+            # 메시지 드롭아웃
             ego_embeddings = nn.Dropout(self.mess_dropout)(ego_embeddings)
 
-            # normalize the distribution of embeddings.
+            # 임베딩 일반화
             norm_embeddings = F.normalize(ego_embeddings, p=2, dim=1)
 
+            # k번째 임베딩 저장
             all_embeddings += [norm_embeddings]
 
+        # 임베딩 Concatenation
         all_embeddings = torch.cat(all_embeddings, 1)
+
         u_g_embeddings = all_embeddings[:self.num_users, :]
         i_g_embeddings = all_embeddings[self.num_users:, :]
 
-        # embedding lookup
+        # 필요한 임베딩 가져가기
         u_g_embeddings = u_g_embeddings[users, :]
         pos_i_g_embeddings = i_g_embeddings[pos_items, :]
         neg_i_g_embeddings = i_g_embeddings[neg_items, :]
 
-        return u_g_embeddings, pos_i_g_embeddings, neg_i_g_embeddings
+        return u_g_embeddings, pos_i_g_embeddings, neg_i_g_embeddings, i_g_embeddings
 
     def fit(self):
-        optimizer = optim.Adam(self.parameters(), lr=self.learning_rate)
-        
+        user_idx = np.arange(self.num_users)
         for epoch in range(self.num_epochs):
-            loss, mf_loss, emb_loss = 0.0, 0.0, 0.0
-
-            data_loader = PairwiseGenerator(self.train, num_negatives=1, batch_size=self.batch_size, shuffle=True, device=self.device)
-
             start_time = time()
 
-            for batch_data in data_loader:
-                user, pos_items, neg_items = batch_data
+            epoch_loss = 0.0
 
-                optimizer.zero_grad()
+            self.train()
 
-                u_embeddings, pos_i_embeddings, neg_i_embeddings = self.forward(user, pos_items, neg_items)
+            np.random.RandomState(12345).shuffle(user_idx)
 
-                batch_loss, batch_mf_loss, batch_emb_loss = self.create_bpr_loss(u_embeddings, pos_i_embeddings, neg_i_embeddings)
+            batch_num = int(len(user_idx) / self.batch_size) + 1
 
-                batch_loss.backward()
-                optimizer.step()
+            if self.use_bpr:
+                data_loader = PairwiseGenerator(self.train_mat.toarray(), num_negatives=1, batch_size=self.batch_size, shuffle=True, device=self.device)
 
-                loss += batch_loss
-                mf_loss += batch_mf_loss
-                emb_loss += batch_emb_loss
-            
-            print('Epoch %d [%.1fs]: train_loss [%.5f = %.5f + %.5f]' % (epoch, time() - start_time, loss, mf_loss, emb_loss))
+                for batch_data in data_loader:
+                    user, pos_items, neg_items = batch_data
+
+                    batch_loss = self.train_model_per_batch(user, pos_items, neg_items)
+
+                    if torch.isnan(batch_loss):
+                        print('Loss NAN. Train finish.')
+                        break
+
+                    epoch_loss += batch_loss
+            else:
+                for batch_idx in range(batch_num):
+                    batch_users = user_idx[batch_idx*self.batch_size:(batch_idx+1)*self.batch_size]
+                    batch_matrix = torch.FloatTensor(self.train_mat[batch_users, :].toarray()).to(self.device)
+                    batch_users = torch.LongTensor(batch_users).to(self.device)
+                    batch_loss = self.train_model_per_batch(batch_matrix, batch_users)
+
+                    if torch.isnan(batch_loss):
+                        print('Loss NAN. Train finish.')
+                        break
+                    
+                    epoch_loss += batch_loss
+
+            print('Epoch %d [%.1fs]: train_loss [%.5f = %.5f + %.5f]' % (epoch, time() - start_time, epoch_loss, 0, 0))
     
+    def train_model_per_batch(self, train_matrix, batch_users, pos_items=0, neg_items=0):
+        # grad 초기화
+        self.optimizer.zero_grad()
+
+        if self.use_bpr:
+            u_embeddings, pos_i_embeddings, neg_i_embeddings, _ = self.forward(batch_users, pos_items, neg_items)
+
+            # loss 구함
+            loss = self.create_bpr_loss(u_embeddings, pos_i_embeddings, neg_i_embeddings)
+
+        else:
+            u_g_embeddings, _, _, i_g_embeddings = self.forward(batch_users, 0, 0)
+
+            output = torch.sigmoid(torch.matmul(u_g_embeddings, torch.transpose(i_g_embeddings, 0, 1)))
+
+            # loss 구함
+            loss = F.binary_cross_entropy(output, train_matrix, reduction='none').sum(1).mean()
+
+        # 역전파
+        loss.backward()
+
+        # 최적화
+        self.optimizer.step()
+
+        return loss
+
     def predict(self, user_ids, item_ids):
         with torch.no_grad():
-            user_embs, item_embs, _ = self.forward(user_ids, item_ids, item_ids)
-
-            return self.rating(user_embs, item_embs).detach().cpu().numpy()
-    
+            u_g_embeddings, _, _, i_g_embeddings = self.forward(user_ids, 0, 0)
+            output = torch.sigmoid(torch.matmul(u_g_embeddings, torch.transpose(i_g_embeddings, 0, 1)))
+            predict_ = output.detach().cpu().numpy()
+            return predict_[item_ids]
+            
     def create_adj_mat(self):
         adj_mat = sp.dok_matrix((self.num_users + self.num_items, self.num_users + self.num_items), dtype=np.float32)
+
         adj_mat = adj_mat.tolil()
         R = sp.csr_matrix(self.R).tolil()
 
@@ -238,9 +289,10 @@ class PairwiseGenerator:
             u_items = self.input_matrix[u]
             
             self.pos_dict[u] = u_items
-        
+        pos_items = np.where(self.input_matrix[u] > 0.5)[0]        
+
         for u in range(self.num_users):
-            neg_items = list(set(range(self.num_items)) - set(self.input_matrix[u]))
+            neg_items = list(set(range(self.num_items)) - set(pos_items))
             self.neg_dict[u] = neg_items
 
     def __len__(self):
