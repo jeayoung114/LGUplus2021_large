@@ -1,5 +1,5 @@
 # LGUplus2021_large
-Framework on recommender systems for KMRD-2m, 5m datasets with implicit feedback
+Framework for recommender systems on KMRD-2m, 5m datasets with implicit feedback
 
 - Linear item-item collaborative filtering
   - EASE<sup>R</sup>
