@@ -10,3 +10,7 @@ Framework on recommender systems for KMRD-2m, 5m datasets with implicit feedback
   - DAE
   - CDAE
   - MultVAE
+
+## How to run
+1. Edit models' hyper-parameters you want in ```main.py```.
+2. Run ```main.py```.
